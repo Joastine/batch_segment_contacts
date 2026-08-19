@@ -1,0 +1,17 @@
+# Raw sensor recordings
+/data/
+
+# Extracted per-batch and combined datasets
+/all_batches_events*/
+/batch_*/
+
+# Python cache
+/__pycache__/
+*.py[cod]
+
+# Generated review pages and previews
+/*review*.html
+/*review*.png
+
+# Local temporary verification outputs
+/.new-grid*/
