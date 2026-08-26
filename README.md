@@ -63,7 +63,7 @@ python plot_random_events.py --help
 3. 对原始通道做短窗中位数去抖；
 4. 将 G-code 节拍与传感器活动自动对齐；
 5. 在预测时间附近根据通道相对变化确定接触时间；
-6. 提取接触前 `0.5 s` 和接触后 `1.5 s`；
+6. 提取接触前 `2.0 s` 和接触后 `3.0 s`；
 7. 标记 `baseline`、`contact` 和 `separation`；
 8. 生成坐标、事件和批次标签。
 
@@ -73,7 +73,7 @@ python plot_random_events.py --help
 abs(changed - baseline) / max(abs(baseline), relative_floor)
 ```
 
-默认阈值为 `0.20`，即 20%。
+默认阈值为 `1.0`，即 100%。
 
 单独处理一批，例如第 17 批：
 
@@ -82,7 +82,7 @@ python segment_contact_events.py `
   "data\point_grid_21x31_inclusive_step1_repeat1_movewait2_hold1_z8_17.csv" `
   "point_grid_21x31_inclusive_step1_repeat1_movewait2_hold1_z8.gcode" `
   --batch-id 17 `
-  --threshold 0.20 `
+  --threshold 1.0 `
   --output-dir "all_batches_events_21x31\batch_17"
 ```
 
@@ -108,6 +108,7 @@ python batch_segment_contacts.py --reuse-existing
 - G-code SHA-256；
 - G-code 解析出的事件数量；
 - 检测阈值；
+- 接触点前后的提取窗口；
 - 是否只导出已确认事件；
 - 是否生成单事件文件。
 
@@ -125,13 +126,19 @@ python batch_segment_contacts.py --expected-batches 5 --reuse-existing
 python batch_segment_contacts.py --exclude-batches 3 11 --reuse-existing
 ```
 
-修改检测阈值为 30%：
+临时修改检测阈值为 80%：
 
 ```powershell
-python batch_segment_contacts.py --threshold 0.30
+python batch_segment_contacts.py --threshold 0.80
 ```
 
-修改阈值时不要使用 `--reuse-existing`，因为需要用新阈值重新计算各批结果。
+临时修改接触点前后的提取窗口：
+
+```powershell
+python batch_segment_contacts.py --before 2.0 --after 3.0
+```
+
+修改阈值或提取窗口后可以继续使用 `--reuse-existing`；脚本会识别参数变化并自动重新计算不匹配的旧结果。
 
 不生成每个事件的独立 CSV：
 
@@ -173,10 +180,10 @@ python plot_random_events.py `
 
 ```powershell
 python plot_random_events.py `
-  --count 5 `
-  --x 2 `
-  --y 16 `
-  --output "coordinate_2_16_review.html"
+  --count 20 `
+  --x 17 `
+  --y 14 `
+  --output "coordinate_17_14_review.html"
 ```
 
 审核指定事件：

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Create an interactive review plot for randomly sampled contact events."""
+"""从合并事件数据中抽样，并生成包含 20 通道曲线的交互式审核页面。
+
+生成的 HTML 将样本数据和绘图代码全部内嵌，因此无需启动服务器，也不依赖
+外部 JavaScript 库；直接用浏览器打开即可审核。
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
+    """解析随机抽样、批次/坐标筛选和输出文件参数。"""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "events_csv",
@@ -55,6 +61,12 @@ def load_sample(
     y_filter: float | None = None,
     requested_sample_ids: list[str] | None = None,
 ) -> tuple[list[str], list[dict[str, object]], int]:
+    """读取 all_events.csv，筛选并返回待审核的完整事件。
+
+    CSV 中同一个 sample_id 对应的所有采样行会被组合为一个事件。指定
+    sample_ids 时保持用户给定顺序，否则使用固定随机种子进行可重复抽样。
+    """
+
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
@@ -65,6 +77,7 @@ def load_sample(
         ]
         has_batch_id = "batch_id" in reader.fieldnames
         has_sample_id = "sample_id" in reader.fieldnames
+        # 先完成批次和坐标过滤，再按 sample_id 收集完整时间序列。
         grouped: dict[str, list[dict[str, str]]] = {}
         for row in reader:
             batch_id = int(row.get("batch_id") or 0)
@@ -86,16 +99,19 @@ def load_sample(
 
     available_count = len(grouped)
     if requested_sample_ids:
+        # 精确审核模式：不执行随机抽样，并检查每个 ID 都存在。
         missing = [sample_id for sample_id in requested_sample_ids if sample_id not in grouped]
         if missing:
             raise ValueError("sample IDs not found after filtering: " + ", ".join(missing))
         chosen = requested_sample_ids
     else:
+        # 随机审核模式：相同 seed、筛选条件和输入数据会得到相同事件集合。
         if count > available_count:
             raise ValueError(
                 f"requested {count} events, but only {available_count} match the filters"
             )
         chosen = sorted(random.Random(seed).sample(list(grouped), count))
+    # 仅保留浏览器绘图需要的字段，以减小生成 HTML 的体积。
     events: list[dict[str, object]] = []
     for sample_id in chosen:
         rows = grouped[sample_id]
@@ -125,6 +141,9 @@ def load_sample(
 def create_html(
     channels: list[str], events: list[dict[str, object]], seed: int, available_count: int
 ) -> str:
+    """把事件数据序列化到一个自包含的交互式 HTML 字符串中。"""
+
+    # 使用紧凑 JSON；ensure_ascii=False 可让页面中的中文保持可读。
     payload = json.dumps(events, ensure_ascii=False, separators=(",", ":"))
     channel_payload = json.dumps(channels, ensure_ascii=False, separators=(",", ":"))
     return f"""<!doctype html>
@@ -213,9 +232,9 @@ def create_html(
   <div class="viz-row text-small text-muted" id="cer-meta">候选事件 {available_count} 个 · 随机种子 {seed} · 实线为原始通道数据</div>
   <div class="viz-controls" id="cer-event-buttons" aria-label="选择事件"></div>
   <div class="cer-phase-key text-small" aria-label="阶段说明">
-    <span><i class="cer-phase cer-baseline"></i>baseline −0.5–0 s</span>
+    <span><i class="cer-phase cer-baseline"></i>baseline −2–0 s</span>
     <span><i class="cer-phase cer-contact"></i>contact 0–1 s</span>
-    <span><i class="cer-phase cer-separation"></i>separation 1–1.5 s</span>
+    <span><i class="cer-phase cer-separation"></i>separation 1–3 s</span>
     <span><i class="cer-onset"></i>检测接触点 t=0</span>
   </div>
   <div id="cer-heading" class="cer-heading" aria-live="polite"></div>
@@ -306,14 +325,14 @@ def create_html(
     if (yMin === yMax) {{ yMin -= 1; yMax += 1; }}
     const pad = (yMax - yMin) * 0.07;
     yMin -= pad; yMax += pad;
-    const xMin = -0.5, xMax = 1.5;
+    const xMin = -2, xMax = 3;
     const sx = t => margin.left + (t - xMin) / (xMax - xMin) * innerW;
     const sy = v => margin.top + (yMax - v) / (yMax - yMin) * innerH;
     const svg = el('svg', {{viewBox: `0 0 ${{width}} ${{height}}`, role: 'img', 'aria-label': `${{channel}} 随时间变化图`}});
     svg.append(el('title', {{}}, `${{channel}}，${{event.sampleId}}`));
     svg.append(el('desc', {{}}, '横轴为检测点前后时间，纵轴为原始传感器读数。'));
 
-    [[-0.5, 0, 'var(--viz-series-2)'], [0, 1, 'var(--viz-series-3)'], [1, 1.5, 'var(--viz-series-4)']].forEach(([a,b,c]) => {{
+    [[-2, 0, 'var(--viz-series-2)'], [0, 1, 'var(--viz-series-3)'], [1, 3, 'var(--viz-series-4)']].forEach(([a,b,c]) => {{
       svg.append(el('rect', {{x: sx(a), y: margin.top, width: sx(b)-sx(a), height: innerH, fill: c, opacity: 0.09}}));
     }});
     const yTicks = [yMin, (yMin + yMax) / 2, yMax];
@@ -321,8 +340,8 @@ def create_html(
       svg.append(el('line', {{x1: margin.left, x2: width-margin.right, y1: sy(value), y2: sy(value), class: 'cer-grid'}}));
       svg.append(el('text', {{x: margin.left-6, y: sy(value)+4, 'text-anchor': 'end', class: 'cer-tick'}}, nice(value)));
     }});
-    [-0.5, 0, 0.5, 1, 1.5].forEach(value => {{
-      svg.append(el('text', {{x: sx(value), y: height-22, 'text-anchor': value === -0.5 ? 'start' : value === 1.5 ? 'end' : 'middle', class: 'cer-tick'}}, value.toFixed(1)));
+    [-2, -1, 0, 1, 2, 3].forEach(value => {{
+      svg.append(el('text', {{x: sx(value), y: height-22, 'text-anchor': value === -2 ? 'start' : value === 3 ? 'end' : 'middle', class: 'cer-tick'}}, value.toFixed(1)));
     }});
     svg.append(el('rect', {{x: margin.left, y: margin.top, width: innerW, height: innerH, class: 'cer-frame', 'data-chart-frame': ''}}));
     svg.append(el('line', {{x1: sx(0), x2: sx(0), y1: margin.top, y2: margin.top+innerH, class: 'cer-onset-line'}}));
@@ -387,6 +406,8 @@ def create_html(
 
 
 def main() -> None:
+    """加载审核样本并将交互页面写入指定路径。"""
+
     args = parse_args()
     channels, events, available_count = load_sample(
         args.events_csv,

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Segment magnetic-sensor contact events and label them from a G-code grid.
+"""从连续磁传感器数据中分割接触事件，并根据 G-code 添加坐标标签。
 
-Only the Python standard library is required.  The G-code supplies the event
-order and grid coordinates; the sensor change supplies the refined event time
-and the configurable threshold check.
+G-code 提供接触事件的顺序和二维坐标；传感器数据用于校准 G-code 与采集设备
+之间的时钟偏差，并在预测时刻附近确定实际接触点。脚本只依赖 Python 标准库。
 """
 
 from __future__ import annotations
@@ -24,6 +23,8 @@ MAG_SUFFIX = "_mag"
 
 
 def sha256(path: Path) -> str:
+    """分块计算文件的 SHA-256，避免一次性将大型 CSV 读入内存。"""
+
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -32,6 +33,8 @@ def sha256(path: Path) -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析单批处理参数，并在读取数据前检查参数范围。"""
+
     parser = argparse.ArgumentParser(
         description="Split 20-channel magnetic contact data and add (x, y) mm labels."
     )
@@ -40,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.20,
-        help="relative-change threshold as a fraction (default: 0.20 = 20%%)",
+        default=1.0,
+        help="relative-change threshold as a fraction (default: 1.0 = 100%%)",
     )
     parser.add_argument(
         "--relative-floor",
@@ -52,14 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--before",
         type=float,
-        default=0.5,
-        help="seconds retained before the detected change (default: 0.5)",
+        default=2.0,
+        help="seconds retained before the detected change (default: 2.0)",
     )
     parser.add_argument(
         "--after",
         type=float,
-        default=1.5,
-        help="seconds retained after the detected change (default: 1.5)",
+        default=3.0,
+        help="seconds retained after the detected change (default: 3.0)",
     )
     parser.add_argument(
         "--contact-duration",
@@ -112,10 +115,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def median(values: Iterable[float]) -> float:
+    """计算中位数并统一返回浮点数。"""
+
     return float(statistics.median(values))
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
+    """通过线性插值计算分位数，fraction 的取值范围通常为 0～1。"""
+
     ordered = sorted(values)
     if not ordered:
         raise ValueError("cannot take percentile of an empty sequence")
@@ -128,6 +135,8 @@ def percentile(values: Sequence[float], fraction: float) -> float:
 
 
 def read_sensor_csv(path: Path) -> tuple[list[str], list[float], list[list[float]]]:
+    """读取并校验 timestamp 加 20 个传感器通道的原始 CSV。"""
+
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle)
         try:
@@ -157,7 +166,12 @@ def read_sensor_csv(path: Path) -> tuple[list[str], list[float], list[list[float
 
 
 def parse_gcode(path: Path) -> tuple[list[dict[str, float]], float]:
-    """Return Z-contact movement starts with their current XY coordinates."""
+    """解析每次向上 Z 运动的起点时间和 XY 坐标，并返回 G-code 总时长。
+
+    当前采集程序在探头向上接近传感器表面时产生接触，因此将 ``new_z > z``
+    视为一个接触事件。标签坐标以所有接触点的最小 X/Y 为 (0, 0)。
+    """
+
     x = y = z = elapsed = 0.0
     feed = 2000.0
     contacts: list[dict[str, float]] = []
@@ -203,8 +217,8 @@ def parse_gcode(path: Path) -> tuple[list[dict[str, float]], float]:
     min_x = min(item["gcode_x"] for item in contacts)
     min_y = min(item["gcode_y"] for item in contacts)
     for item in contacts:
-        # Normalize the contacted grid's minimum coordinate to label (0, 0).
-        # For the inclusive 21 x 31 G-code this preserves X=0..20, Y=0..30.
+        # 将实际接触网格的最小坐标归一化为标签 (0, 0)。对于包含边界的
+        # 21 × 31 G-code，最终标签范围正好是 X=0～20、Y=0～30。
         item["label_x_mm"] = item["gcode_x"] - min_x
         item["label_y_mm"] = item["gcode_y"] - min_y
     return contacts, elapsed
@@ -216,6 +230,11 @@ def resample_and_smooth(
     bin_seconds: float,
     smooth_seconds: float,
 ) -> tuple[list[float], list[list[float]]]:
+    """将不规则时间戳数据按固定时间箱重采样，再进行逐通道中位数平滑。
+
+    空时间箱沿用最近一次有效值。返回的时间以原始 CSV 首个时间戳为零点。
+    """
+
     start = times[0]
     bin_count = int((times[-1] - start) / bin_seconds) + 1
     bins: list[list[Sequence[float]]] = [[] for _ in range(bin_count)]
@@ -232,14 +251,14 @@ def resample_and_smooth(
     if resampled[0] is None:
         raise ValueError("failed to resample the first sensor row")
 
-    # A centred median removes the asynchronous channel-update spikes visible
-    # in the raw rows without blurring the roughly one-second contact plateau.
+    # 居中中位数滤波可去除各通道异步刷新形成的尖峰，同时尽量保留约 1 秒的
+    # 接触平台，不像均值滤波那样容易被极端读数拉偏。
     radius = max(0, int(round(smooth_seconds / bin_seconds / 2.0)))
     smoothed: list[list[float]] = []
     filled = [row for row in resampled if row is not None]
     if len(filled) != len(resampled):
-        # Only possible for empty bins before the first observed bin, but keep
-        # a safe forward fill for unusual timestamp input.
+        # 正常数据只可能在首个有效时间箱之前出现空箱；这里仍使用前向填充，
+        # 以兼容时间戳间隔异常的输入。
         first = filled[0]
         last = first
         normalized: list[list[float]] = []
@@ -264,12 +283,14 @@ def find_activity_onsets(
     channel_names: Sequence[str],
     bin_seconds: float,
 ) -> tuple[list[float], float]:
+    """利用五个磁场强度通道寻找粗略接触活动的开始时刻。"""
+
     mag_indices = [i for i, name in enumerate(channel_names) if name.endswith(MAG_SUFFIX)]
     if len(mag_indices) != 5:
         raise ValueError("expected exactly five *_mag channels")
     envelope = [max(row[index] for index in mag_indices) for row in smoothed]
-    # A one-second contact every ~3.5 seconds occupies about 29% of the file.
-    # The 70th percentile therefore gives a data-derived coarse activity level.
+    # 每约 3.5 秒出现 1 秒接触，活动数据约占文件的 29%，因此使用第 70
+    # 百分位作为由当前数据自适应得到的粗检测水平。
     level = percentile(envelope, 0.70)
     max_gap_bins = max(1, int(round(0.35 / bin_seconds)))
     min_run_bins = max(1, int(round(0.25 / bin_seconds)))
@@ -293,6 +314,8 @@ def find_activity_onsets(
 
 
 def linear_fit(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float]:
+    """最小二乘拟合 ``y = slope * x + offset``。"""
+
     x_mean = statistics.fmean(xs)
     y_mean = statistics.fmean(ys)
     denominator = sum((x - x_mean) ** 2 for x in xs)
@@ -305,13 +328,18 @@ def linear_fit(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float]:
 def align_gcode_clock(
     contacts: Sequence[dict[str, float]], activity_onsets: Sequence[float]
 ) -> tuple[float, float, int]:
+    """拟合 G-code 时间到传感器相对时间的线性映射。
+
+    返回时钟缩放系数、时间偏移和最终参与拟合的匹配事件数。全局搜索允许
+    采集程序在 G-code 运行前已经启动、在运行结束后仍继续记录。
+    """
+
     if len(activity_onsets) < 2:
         raise ValueError("not enough coarse sensor activity to align the G-code clock")
     gcode_times = [item["gcode_time"] for item in contacts]
-    # The logger may have been left running well before/after a scan.  Search
-    # globally for the complete G-code cadence instead of aligning file endpoints.
-    # Candidate offsets are voted for by every 10th G-code event, then the best
-    # few candidates are evaluated against all contacts.
+    # 记录程序可能在扫描前很久启动，或在扫描结束后仍继续运行，所以不能直接
+    # 对齐文件首尾。先用每 10 个 G-code 事件对候选偏移投票，再用全部接触事件
+    # 评估得票最高的候选项。
     best: tuple[int, float, float, float] | None = None
     maximum_offset = activity_onsets[-1] - gcode_times[-1] * 0.98 + 10.0
     for slope_step in range(1960, 2061):
@@ -383,6 +411,8 @@ def window_median(
     start: float,
     end: float,
 ) -> list[float]:
+    """计算指定相对时间窗口内 20 个通道各自的中位数。"""
+
     first = max(0, int(math.floor(start / bin_seconds)))
     last = min(len(smoothed), int(math.ceil(end / bin_seconds)))
     if last <= first:
@@ -399,6 +429,13 @@ def refine_event(
     threshold: float,
     relative_floor: float,
 ) -> dict[str, object]:
+    """在 G-code 预测时刻附近搜索传感器变化最明显的实际接触点。
+
+    每个候选时刻分别计算接触前基线和接触后读数，并使用
+    ``abs(changed-baseline) / max(abs(baseline), relative_floor)`` 评价变化。
+    任一通道严格大于 threshold 时，该事件通过阈值判定。
+    """
+
     candidates: list[dict[str, object]] = []
     steps = int(round(0.9 / bin_seconds)) + 1
     for step_index in range(steps):
@@ -412,8 +449,8 @@ def refine_event(
         passed = [index for index, change in enumerate(changes) if change > threshold]
         strongest = max(range(20), key=lambda index: changes[index])
         top = sorted(changes, reverse=True)[:5]
-        # Number of independently changed channels is a robust primary score;
-        # capped top changes prevent a near-zero channel from dominating timing.
+        # 独立变化通道数是更稳健的主评分；同时限制最大变化贡献，避免基线接近
+        # 零的单个通道因相对变化率过大而主导接触时刻。
         score = (len(passed), sum(min(value, 5.0) for value in top))
         candidates.append(
             {
@@ -425,9 +462,8 @@ def refine_event(
             }
         )
 
-    # Choose the strongest sustained transition.  Prefer the G-code-aligned
-    # candidate on ties; raw single-channel noise can otherwise pull the
-    # reported onset to the left edge of the search interval.
+    # 选择变化最强且涉及通道最多的候选点；评分相同时优先靠近 G-code 预测时刻，
+    # 防止单通道噪声把接触点拉到搜索区间的左边缘。
     selected = max(
         candidates,
         key=lambda item: (
@@ -447,6 +483,8 @@ def refine_event(
 
 
 def phase(relative_time: float, contact_duration: float) -> str:
+    """按照相对接触时刻将一行样本标记为 baseline/contact/separation。"""
+
     if relative_time < 0:
         return "baseline"
     if relative_time < contact_duration:
@@ -455,12 +493,18 @@ def phase(relative_time: float, contact_duration: float) -> str:
 
 
 def clean_number(value: float) -> int | float:
+    """将数值上等于整数的坐标写成整数，避免出现 2.000000 等标签。"""
+
     rounded = round(value)
     return int(rounded) if math.isclose(value, rounded, abs_tol=1e-9) else value
 
 
 def main() -> None:
+    """执行单批事件检测、切片、标注和结果文件写出。"""
+
     args = parse_args()
+
+    # 第一步：读取两种时间序列，并从 G-code 得到理论事件时刻及坐标。
     header, times, raw_values = read_sensor_csv(args.csv_file)
     channel_names = header[1:]
     contacts, gcode_duration = parse_gcode(args.gcode_file)
@@ -470,6 +514,8 @@ def main() -> None:
     activity_onsets, activity_level = find_activity_onsets(
         smoothed, channel_names, args.bin_seconds
     )
+
+    # 第二步：将 G-code 时钟映射到传感器时钟，消除启动延迟和轻微时钟漂移。
     clock_scale, clock_offset, clock_matches = align_gcode_clock(contacts, activity_onsets)
 
     batch_id = args.batch_id
@@ -478,6 +524,7 @@ def main() -> None:
         batch_id = int(batch_match.group(1)) if batch_match else 0
     batch_name = f"batch_{batch_id:02d}"
 
+    # 第三步：逐事件细化接触时刻，并记录原始 CSV 中对应的切片范围。
     manifests: list[dict[str, object]] = []
     for event_id, contact in enumerate(contacts):
         predicted = clock_scale * contact["gcode_time"] + clock_offset
@@ -516,6 +563,8 @@ def main() -> None:
             }
         )
 
+    # 第四步：写出事件时序数据。events.csv 合并本批全部事件；individual/
+    # 中的文件则便于人工审核单个事件。
     output_dir = args.output_dir or args.csv_file.with_name(args.csv_file.stem + "_events")
     output_dir.mkdir(parents=True, exist_ok=True)
     individual_dir = output_dir / "individual"
@@ -569,6 +618,7 @@ def main() -> None:
                     writer.writerow(output_header)
                     writer.writerows(rows)
 
+    # manifest.csv 每个事件仅占一行，适合作为索引和质量检查清单。
     manifest_fields = [
         "batch_id",
         "sample_id",
@@ -600,6 +650,7 @@ def main() -> None:
     confirmed = sum(bool(item["threshold_passed"]) for item in manifests)
     label_x_values = sorted({item["label_x_mm"] for item in contacts})
     label_y_values = sorted({item["label_y_mm"] for item in contacts})
+    # metadata.json 保存输入哈希、参数和对齐质量，供批处理脚本判断能否复用。
     metadata = {
         "source_csv": str(args.csv_file.resolve()),
         "source_gcode": str(args.gcode_file.resolve()),
